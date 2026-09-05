@@ -47,11 +47,45 @@ go run ./examples/echo echo 'Hello' --output json
 
 ## Inputs
 
-Only changed flags and supplied positionals become arguments; schema defaults are not eagerly copied. Omitted values, `false`, zero, empty strings, empty arrays and JSON `null` retain their meaning. Primitive fields accept typed flag values; arrays and objects accept JSON. Inline nested object properties additionally produce flags such as `--patch-title`; `Binding.Flags` can rename them.
+Only changed flags and supplied positionals become arguments; schema defaults are not eagerly copied. Primitive fields accept typed flag values. Inline nested objects produce flags such as `--patch-title`; `Binding.Flags` can rename them. Ordinary collections do not require JSON:
+
+```sh
+# An array of strings: one flag per value, preserving commas and empty strings.
+nudge issue update ISSUE-ID --patch-labels bug --patch-labels 'customer,urgent'
+
+# Explicit empty collection and null are distinct from omission and literal text.
+nudge issue update ISSUE-ID --clear-patch-labels --unset-patch-assignee
+nudge issue update ISSUE-ID --patch-assignee null  # literal string "null"
+```
+
+Arrays of strings, integers, numbers, or booleans accept repeated flags. Values are not split at commas. Integers retain 64-bit precision, `false` stays false, and an empty string remains one string element. `--clear-FIELD` supplies an empty array or object; `--unset-FIELD` supplies null for a nullable schema. Omit these flags to preserve a field. Do not pass `=false` to a clear/unset switch: those are actions, not stored booleans.
+
+### Arrays of objects
+
+Child flags use a zero-based `INDEX=VALUE` argument. This creates ordinary Cobra flags with ordinary help and completion; there is no shell-command or dynamic-flag rewriting. For a tool accepting `issues` with `title`, `labels`, and `assignee` properties:
+
+```sh
+nudge bulk-create-issues \
+  --issues-title '0=Fix retries' \
+  --issues-title '1=Document recovery' \
+  --issues-labels '0=bug' --issues-labels '0=urgent' \
+  --clear-issues-labels 1 \
+  --unset-issues-assignee 1
+```
+
+The indices select objects, so repeated scalar-array flags at the same index append elements to that object's array. Supply every required property of each object. Flag order does not matter; indices must be contiguous from zero. Use only decimal indices without a sign or leading zeroes. Everything after the first `=` is the value, including any further equals signs.
+
+Nested object arrays use one dot-separated index for each surrounding array. For example, `--issues-filters-field '0.1=status'` sets the second filter of the first issue. `--issues-filters-values '0.1=started'` adds one scalar to that filter's values. The corresponding clear action is `--clear-issues-filters-values 0.1`. An array of arrays uses an `-item` child flag, for example `--matrix-item '0=1' --matrix-item '0=2' --matrix-item '1=3'` supplies `[[1,2],[3]]`.
+
+Each scalar field/index may be assigned once. Duplicate scalar flags, parent-plus-child inputs, and collection values combined with clear/unset actions fail before invocation. Helpers follow field aliases (`patch.labels` aliased to `labels` gives `--clear-labels`); indexed binding paths use `[]`, for example `issues.[].title`. Helper names participate in the same collision checks as other flags.
+
+### Optional JSON input
+
+Full-array JSON flag values remain supported for compatibility, for example `--patch-labels '["bug","urgent"]'`. A string that is itself a valid JSON array is interpreted as a full-array value; use optional whole-object input when such text must be a literal array element. A full-array value cannot be combined with repeated elements for the same field. Parent object/complex-array flags also retain their JSON form.
 
 `--input FILE` accepts one complete JSON object; `--input -` reads stdin. It cannot combine with argument flags or positionals. The default maximum input is 20,000,000 bytes, configurable through `Options.MaxInputBytes`. Input JSON numbers retain their original representation when passed to `Invoke`. Validation uses native 64-bit integers and floating-point numbers; larger integers/out-of-range numbers fail explicitly.
 
-The complete schema is validated by `github.com/google/jsonschema-go`, including properties not expanded into flags. Nested properties reached only through `$ref` or unions do not become flattened child flags. `$ref`, unions, and more complex nested schemas can use the parent JSON flag or `--input`; this library does not invent a competing JSON Schema engine. Property names containing dots should use whole-object input, because binding/column paths use dot notation. Schema flags conflicting with reserved names (`input`, `output`, `help`) or inherited flags must be renamed through bindings. For example, alias a tool’s `url` property to `resource-url` when the application already uses `--url` for its server endpoint. Command and flag names must start with an ASCII letter or digit and contain only letters, digits, hyphens, and underscores.
+The complete schema is validated by `github.com/google/jsonschema-go`, including properties not expanded into flags. Child flag discovery is bounded to eight nested levels. Nested properties reached only through `$ref` or unions do not become flattened child flags. `$ref`, unions, and more complex nested schemas can use the parent JSON flag or `--input`; this library does not invent a competing JSON Schema engine. Property names containing dots should use whole-object input, because binding/column paths use dot notation. Schema flags conflicting with reserved names (`input`, `output`, `help`), generated helpers, or inherited flags must be renamed through bindings. For example, alias a tool’s `url` property to `resource-url` when the application already uses `--url` for its server endpoint. Command and flag names must start with an ASCII letter or digit and contain only letters, digits, hyphens, and underscores.
 
 ## Outputs and errors
 

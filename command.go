@@ -12,7 +12,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -117,21 +116,6 @@ func AddCommands(root *cobra.Command, opts Options) error {
 	return nil
 }
 
-type field struct {
-	path, name string
-	schema     *jsonschema.Schema
-	value      string
-}
-
-func (f *field) String() string { return f.value }
-func (f *field) Type() string   { return schemaType(f.schema) }
-func (f *field) Set(s string) error {
-	if _, err := parseValue(s, f.schema); err != nil {
-		return err
-	}
-	f.value = s
-	return nil
-}
 func toolCommand(tool *mcp.Tool, binding Binding, opts Options, parent *cobra.Command) (*cobra.Command, error) {
 	raw, err := json.Marshal(tool.InputSchema)
 	if err != nil {
@@ -154,66 +138,15 @@ func toolCommand(tool *mcp.Tool, binding Binding, opts Options, parent *cobra.Co
 		return nil, errors.New("input flag conflicts with an ancestor flag")
 	}
 	cmd.Flags().String("input", "", "Read the complete JSON argument object from a file, or - for stdin; cannot combine with argument flags")
-	fields := []*field{}
-	var walk func(map[string]*jsonschema.Schema, string, int) error
-	walk = func(properties map[string]*jsonschema.Schema, prefix string, depth int) error {
-		keys := make([]string, 0, len(properties))
-		for key := range properties {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			path := key
-			if prefix != "" {
-				path = prefix + "." + key
-			}
-			name := kebab(strings.ReplaceAll(path, ".", "-"))
-			if alias, ok := binding.Flags[path]; ok {
-				name = alias
-			}
-			if !validName(name) || ancestorFlag(parent, name) || name == "output" || name == "input" || name == "help" || cmd.Flags().Lookup(name) != nil {
-				return fmt.Errorf("flag collision or invalid name %q for %s", name, path)
-			}
-			property := properties[key]
-			f := &field{path: path, name: name, schema: property}
-			fields = append(fields, f)
-			description := safe(property.Description)
-			if description == "" {
-				description = path
-			}
-			if schemaType(property) == "json" || schemaType(property) == "array" || schemaType(property) == "object" {
-				description += " (JSON value)"
-			}
-			cmd.Flags().Var(f, name, description)
-			choices := []string{}
-			for _, value := range property.Enum {
-				if text, ok := value.(string); ok {
-					choices = append(choices, text)
-				}
-			}
-			if err := cmd.RegisterFlagCompletionFunc(name, func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-				return choices, cobra.ShellCompDirectiveNoFileComp
-			}); err != nil {
-				return err
-			}
-
-			if schemaType(property) == "boolean" {
-				cmd.Flags().Lookup(name).NoOptDefVal = "true"
-			}
-			if len(property.Properties) > 0 && depth < 8 {
-				if err := walk(property.Properties, path, depth+1); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	if err := walk(schema.Properties, "", 0); err != nil {
+	fields, err := addFields(cmd, parent, schema.Properties, binding)
+	if err != nil {
 		return nil, err
 	}
 	byPath := map[string]*field{}
 	for _, f := range fields {
-		byPath[f.path] = f
+		if f.mode == "" {
+			byPath[f.path] = f
+		}
 	}
 	for _, path := range binding.Positionals {
 		if byPath[path] == nil {
@@ -271,29 +204,40 @@ func toolCommand(tool *mcp.Tool, binding Binding, opts Options, parent *cobra.Co
 				return errors.New("input must be a JSON object")
 			}
 		} else {
+			node := &argumentNode{}
 			for _, f := range fields {
 				if !cmd.Flags().Changed(f.name) {
 					continue
 				}
-				value, err := parseValue(f.value, f.schema)
-				if err != nil {
-					return err
-				}
-				if err := assign(values, f.path, value); err != nil {
-					return err
+				if err := f.assign(node); err != nil {
+					return fmt.Errorf("--%s: %w", f.name, err)
 				}
 			}
 			for i, value := range args {
 				f := byPath[binding.Positionals[i]]
-				parsed, err := parseValue(value, f.schema)
+				if f.indexCount() > 0 {
+					return fmt.Errorf("indexed properties cannot be positional: %s", f.path)
+				}
+				if cmd.Flags().Changed(f.name) {
+					return fmt.Errorf("duplicate value for %s", f.path)
+				}
+				entry, err := f.parse(value)
 				if err != nil {
 					return err
 				}
-				if err := assign(values, f.path, parsed); err != nil {
+				if err := node.assign(entry.path, entry.value, entry.append); err != nil {
 					return err
 				}
 			}
+			assembled, err := node.materialize()
+			if err != nil {
+				return err
+			}
+			if assembled != nil {
+				values = assembled.(map[string]any)
+			}
 		}
+
 		validation, err := validationValue(values)
 		if err != nil {
 			return err
@@ -369,30 +313,6 @@ func decodeValue(raw []byte) (any, error) {
 		return nil, errors.New("expected exactly one JSON value")
 	}
 	return value, nil
-}
-func assign(root map[string]any, path string, value any) error {
-	parts := strings.Split(path, ".")
-	current := root
-	for _, part := range parts[:len(parts)-1] {
-		existing, ok := current[part]
-		if !ok {
-			next := map[string]any{}
-			current[part] = next
-			current = next
-			continue
-		}
-		next, ok := existing.(map[string]any)
-		if !ok {
-			return fmt.Errorf("conflicting values for %s", path)
-		}
-		current = next
-	}
-	leaf := parts[len(parts)-1]
-	if _, exists := current[leaf]; exists {
-		return fmt.Errorf("duplicate value for %s", path)
-	}
-	current[leaf] = value
-	return nil
 }
 func kebab(s string) string {
 	var b strings.Builder
